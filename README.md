@@ -1,6 +1,6 @@
   - 注意修改tampermonkey代码.js里面的密码管理系统地址
   - 注意一定要先添加OAUTH_ID，指定授权账号ID。你使用的那个第三方授权就填写那个账号ID
-
+  - 使用chrome扩展，在系统管理页面有课能要多刷新几次令牌才会显示
 -----
 
 # 智能密码管理助手 Pro - Cloudflare Workers 部署指南
