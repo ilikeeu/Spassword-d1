@@ -281,7 +281,7 @@ async function handleOAuthLogin(request, env, corsHeaders) {
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString(); // 10分钟后过期
 
     // 构建授权URL
-    const authUrl = new URL(`${env.OAUTH_BASE_URL}/oauth/authorize`);
+    const authUrl = new URL(`${env.OAUTH_BASE_URL}/oauth2/authorize`);
     authUrl.searchParams.set('client_id', env.OAUTH_CLIENT_ID);
     authUrl.searchParams.set('redirect_uri', env.OAUTH_REDIRECT_URI);
     authUrl.searchParams.set('response_type', 'code');
@@ -356,7 +356,7 @@ async function handleOAuthCallback(request, env, corsHeaders) {
     console.log('Exchanging code for token...');
 
     // 交换授权码获取访问令牌
-    const tokenResponse = await fetch(`${env.OAUTH_BASE_URL}/oauth/token`, {
+    const tokenResponse = await fetch(`${env.OAUTH_BASE_URL}/oauth2/token`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded',
@@ -420,7 +420,7 @@ async function handleOAuthCallback(request, env, corsHeaders) {
       userData.username,
       userData.nickname || userData.username,
       userData.email || '',
-      userData.avatar_url || 'https://yanxuan.nosdn.127.net/233a2a8170847d3287ec058c51cf60a9.jpg',
+      userData.avatar_template || 'https://yanxuan.nosdn.127.net/233a2a8170847d3287ec058c51cf60a9.jpg',
       new Date().toISOString()
     ).run();
 
@@ -431,7 +431,7 @@ async function handleOAuthCallback(request, env, corsHeaders) {
       username: userData.username,
       nickname: userData.nickname || userData.username,
       email: userData.email || '',
-      avatar: userData.avatar_url || 'https://yanxuan.nosdn.127.net/233a2a8170847d3287ec058c51cf60a9.jpg',
+      avatar: userData.avatar_template || 'https://yanxuan.nosdn.127.net/233a2a8170847d3287ec058c51cf60a9.jpg',
       loginAt: new Date().toISOString()
     };
 
