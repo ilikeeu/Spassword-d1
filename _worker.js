@@ -1,4 +1,4 @@
-// 基于HTML5的增强版密码管理器 - Cloudflare Workers + D1 + OAuth + 分页功能 + 密码历史管理
+// 基于HTML5的增强版密码管理器 - Cloudflare Workers + D1 + OAuth + 分页功能 + 密码历史管理 + 分类管理
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -24,6 +24,10 @@ export default {
         return new Response(getHTML5(), {
           headers: { 'Content-Type': 'text/html', ...corsHeaders }
         });
+      }
+      
+      if (path === '/api/health') {
+        return handleHealthCheck(request, env, corsHeaders);
       }
       
       if (path === '/api/oauth/login') {
@@ -108,7 +112,8 @@ export default {
       console.error('Error:', error);
       return new Response(JSON.stringify({ 
         error: 'Internal Server Error',
-        message: error.message 
+        message: error.message,
+        stack: error.stack
       }), { 
         status: 500, 
         headers: { 'Content-Type': 'application/json', ...corsHeaders }
@@ -117,25 +122,63 @@ export default {
   }
 };
 
-// 初始化数据库表
+// 修复后的数据库初始化函数 - 只在首次部署时初始化，避免清空数据
 async function initializeDatabase(env) {
   try {
-    // 检查表是否已存在
-    const checkTables = await env.DB.prepare(`
-      SELECT name FROM sqlite_master 
-      WHERE type='table' AND name IN ('users', 'passwords', 'password_history', 'categories', 'webdav_configs', 'sessions', 'oauth_states')
-    `).all();
+    console.log('🔧 检查数据库状态...');
 
-    if (checkTables.results.length === 7) {
-      // 所有表都已存在
+    // 检查数据库连接
+    if (!env.DB) {
+      throw new Error('❌ 数据库未绑定，请检查 D1 绑定配置');
+    }
+
+    // 测试数据库连接
+    try {
+      const testResult = await env.DB.prepare('SELECT 1 as test').first();
+      console.log('✅ 数据库连接正常');
+    } catch (error) {
+      throw new Error(`❌ 数据库连接失败: ${error.message}`);
+    }
+
+    // 检查是否已经初始化过 - 使用专门的初始化标记表
+    let isInitialized = false;
+    try {
+      const initCheck = await env.DB.prepare(`
+        SELECT value FROM system_config WHERE key = 'database_initialized' LIMIT 1
+      `).first();
+      
+      if (initCheck && initCheck.value === 'true') {
+        console.log('✅ 数据库已初始化，跳过初始化步骤');
+        // 只执行过期数据清理，不做任何表结构变更
+        await cleanupExpiredDataSafely(env);
+        return;
+      }
+    } catch (error) {
+      // system_config 表不存在，说明是首次初始化
+      console.log('📋 检测到首次部署，开始初始化数据库...');
+      isInitialized = false;
+    }
+
+    if (isInitialized) {
       return;
     }
 
-    console.log('初始化数据库表...');
+    console.log('🔧 开始创建数据库表结构...');
 
-    // 创建用户表
+    // 创建系统配置表（最先创建，用于标记初始化状态）
     await env.DB.prepare(`
-      CREATE TABLE IF NOT EXISTS users (
+      CREATE TABLE IF NOT EXISTS system_config (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `).run();
+
+    // 创建数据库表
+    const createTableQueries = [
+      // 创建用户表
+      `CREATE TABLE IF NOT EXISTS users (
         id TEXT PRIMARY KEY,
         username TEXT NOT NULL,
         nickname TEXT,
@@ -143,33 +186,26 @@ async function initializeDatabase(env) {
         avatar TEXT,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-      )
-    `).run();
+      )`,
 
-    // 创建会话表
-    await env.DB.prepare(`
-      CREATE TABLE IF NOT EXISTS sessions (
+      // 创建会话表
+      `CREATE TABLE IF NOT EXISTS sessions (
         token TEXT PRIMARY KEY,
         user_id TEXT NOT NULL,
         user_data TEXT NOT NULL,
         expires_at DATETIME NOT NULL,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
-      )
-    `).run();
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )`,
 
-    // 创建OAuth状态表
-    await env.DB.prepare(`
-      CREATE TABLE IF NOT EXISTS oauth_states (
+      // 创建OAuth状态表
+      `CREATE TABLE IF NOT EXISTS oauth_states (
         state TEXT PRIMARY KEY,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         expires_at DATETIME NOT NULL
-      )
-    `).run();
+      )`,
 
-    // 创建密码表
-    await env.DB.prepare(`
-      CREATE TABLE IF NOT EXISTS passwords (
+      // 创建密码表
+      `CREATE TABLE IF NOT EXISTS passwords (
         id TEXT PRIMARY KEY,
         user_id TEXT NOT NULL,
         site_name TEXT NOT NULL,
@@ -181,83 +217,236 @@ async function initializeDatabase(env) {
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         restored_from TEXT,
-        imported_at DATETIME,
-        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
-      )
-    `).run();
+        imported_at DATETIME
+      )`,
 
-    // 创建密码历史记录表
-    await env.DB.prepare(`
-      CREATE TABLE IF NOT EXISTS password_history (
+      // 创建密码历史表
+      `CREATE TABLE IF NOT EXISTS password_history (
         id TEXT PRIMARY KEY,
         password_id TEXT NOT NULL,
         user_id TEXT NOT NULL,
         old_password TEXT NOT NULL,
         changed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        reason TEXT DEFAULT 'password_update',
-        FOREIGN KEY (password_id) REFERENCES passwords (id) ON DELETE CASCADE,
-        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
-      )
-    `).run();
+        reason TEXT DEFAULT 'password_update'
+      )`,
 
-    // 创建分类表
-    await env.DB.prepare(`
-      CREATE TABLE IF NOT EXISTS categories (
+      // 创建分类表
+      `CREATE TABLE IF NOT EXISTS categories (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id TEXT NOT NULL,
         name TEXT NOT NULL,
+        description TEXT,
+        color TEXT DEFAULT '#6366f1',
+        icon TEXT DEFAULT 'fas fa-folder',
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(user_id, name),
-        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
-      )
-    `).run();
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )`,
 
-    // 创建WebDAV配置表
-    await env.DB.prepare(`
-      CREATE TABLE IF NOT EXISTS webdav_configs (
+      // 创建WebDAV配置表
+      `CREATE TABLE IF NOT EXISTS webdav_configs (
         user_id TEXT PRIMARY KEY,
         webdav_url TEXT NOT NULL,
         username TEXT NOT NULL,
         password TEXT NOT NULL,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
-      )
-    `).run();
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )`
+    ];
 
-    // 创建索引以提高查询性能
-    await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_passwords_user_id ON passwords (user_id)`).run();
-    await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_passwords_site_name ON passwords (site_name)`).run();
-    await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_passwords_username ON passwords (username)`).run();
-    await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_password_history_password_id ON password_history (password_id)`).run();
-    await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions (user_id)`).run();
-    await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions (expires_at)`).run();
-    await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_oauth_states_expires_at ON oauth_states (expires_at)`).run();
+    // 逐个执行创建表语句
+    for (const query of createTableQueries) {
+      try {
+        await env.DB.prepare(query).run();
+        console.log('✅ 表创建成功');
+      } catch (error) {
+        console.error('❌ 创建表失败:', error);
+        throw new Error(`创建表失败: ${error.message}`);
+      }
+    }
 
-    console.log('数据库表初始化完成');
+    // 创建索引（如果不存在）
+    const createIndexQueries = [
+      'CREATE INDEX IF NOT EXISTS idx_passwords_user_id ON passwords (user_id)',
+      'CREATE INDEX IF NOT EXISTS idx_passwords_site_name ON passwords (site_name)',
+      'CREATE INDEX IF NOT EXISTS idx_passwords_username ON passwords (username)',
+      'CREATE INDEX IF NOT EXISTS idx_passwords_category ON passwords (category)',
+      'CREATE INDEX IF NOT EXISTS idx_password_history_password_id ON password_history (password_id)',
+      'CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions (user_id)',
+      'CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions (expires_at)',
+      'CREATE INDEX IF NOT EXISTS idx_oauth_states_expires_at ON oauth_states (expires_at)',
+      'CREATE INDEX IF NOT EXISTS idx_categories_user_id ON categories (user_id)',
+      'CREATE UNIQUE INDEX IF NOT EXISTS idx_categories_user_name ON categories (user_id, name)',
+      'CREATE INDEX IF NOT EXISTS idx_system_config_key ON system_config (key)'
+    ];
 
-    // 清理过期数据
-    await cleanupExpiredData(env);
+    for (const indexQuery of createIndexQueries) {
+      try {
+        await env.DB.prepare(indexQuery).run();
+      } catch (error) {
+        // 索引可能已存在，记录但不抛出错误
+        console.log('索引创建跳过:', error.message);
+      }
+    }
+
+    // 标记数据库已初始化
+    try {
+      await env.DB.prepare(`
+        INSERT OR REPLACE INTO system_config (key, value, created_at, updated_at) 
+        VALUES ('database_initialized', 'true', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+      `).run();
+      
+      // 记录初始化时间
+      await env.DB.prepare(`
+        INSERT OR REPLACE INTO system_config (key, value, created_at, updated_at) 
+        VALUES ('initialized_at', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+      `).bind(new Date().toISOString()).run();
+      
+      // 记录版本信息
+      await env.DB.prepare(`
+        INSERT OR REPLACE INTO system_config (key, value, created_at, updated_at) 
+        VALUES ('database_version', '1.0', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+      `).run();
+      
+      console.log('✅ 数据库初始化标记已设置');
+    } catch (error) {
+      console.error('❌ 设置初始化标记失败:', error);
+      throw new Error(`设置初始化标记失败: ${error.message}`);
+    }
+
+    // 执行首次清理
+    await cleanupExpiredDataSafely(env);
+    
+    console.log('🎉 数据库首次初始化完成！');
 
   } catch (error) {
-    console.error('数据库初始化失败:', error);
-    throw error;
+    console.error('❌ 数据库初始化失败:', error);
+    throw new Error(`数据库初始化失败: ${error.message}`);
   }
 }
 
-// 清理过期数据
-async function cleanupExpiredData(env) {
+// 安全的清理过期数据函数 - 只清理明确过期的数据，不影响用户数据
+async function cleanupExpiredDataSafely(env) {
   try {
     const now = new Date().toISOString();
     
-    // 清理过期会话
-    await env.DB.prepare(`DELETE FROM sessions WHERE expires_at < ?`).bind(now).run();
+    // 只清理明确过期的会话
+    try {
+      const expiredSessions = await env.DB.prepare(`
+        DELETE FROM sessions 
+        WHERE expires_at < ? AND expires_at IS NOT NULL AND expires_at != ''
+      `).bind(now).run();
+      
+      if (expiredSessions.changes > 0) {
+        console.log(`🧹 清理过期会话: ${expiredSessions.changes} 个`);
+      }
+    } catch (error) {
+      console.error('清理过期会话失败:', error);
+    }
     
-    // 清理过期OAuth状态
-    await env.DB.prepare(`DELETE FROM oauth_states WHERE expires_at < ?`).bind(now).run();
+    // 只清理明确过期的OAuth状态
+    try {
+      const expiredStates = await env.DB.prepare(`
+        DELETE FROM oauth_states 
+        WHERE expires_at < ? AND expires_at IS NOT NULL AND expires_at != ''
+      `).bind(now).run();
+      
+      if (expiredStates.changes > 0) {
+        console.log(`🧹 清理过期OAuth状态: ${expiredStates.changes} 个`);
+      }
+    } catch (error) {
+      console.error('清理过期OAuth状态失败:', error);
+    }
+    
+    // 更新最后清理时间
+    try {
+      await env.DB.prepare(`
+        INSERT OR REPLACE INTO system_config (key, value, updated_at) 
+        VALUES ('last_cleanup', ?, CURRENT_TIMESTAMP)
+      `).bind(now).run();
+    } catch (error) {
+      console.error('更新清理时间失败:', error);
+    }
     
   } catch (error) {
     console.error('清理过期数据失败:', error);
+    // 清理失败不应该影响应用运行
+  }
+}
+
+// 健康检查函数 - 增强版本，包含初始化状态
+async function handleHealthCheck(request, env, corsHeaders) {
+  try {
+    // 检查数据库连接
+    if (!env.DB) {
+      throw new Error('数据库未绑定');
+    }
+
+    // 检查初始化状态
+    let initStatus = {};
+    try {
+      const initCheck = await env.DB.prepare(`
+        SELECT key, value, created_at FROM system_config 
+        WHERE key IN ('database_initialized', 'initialized_at', 'database_version', 'last_cleanup')
+      `).all();
+      
+      initStatus = initCheck.results.reduce((acc, row) => {
+        acc[row.key] = {
+          value: row.value,
+          created_at: row.created_at
+        };
+        return acc;
+      }, {});
+    } catch (error) {
+      initStatus.error = error.message;
+    }
+
+    // 检查表是否存在
+    const tables = await env.DB.prepare(`
+      SELECT name FROM sqlite_master WHERE type='table'
+    `).all();
+
+    const expectedTables = ['system_config', 'users', 'sessions', 'oauth_states', 'passwords', 'password_history', 'categories', 'webdav_configs'];
+    const existingTables = tables.results.map(t => t.name);
+    const missingTables = expectedTables.filter(t => !existingTables.includes(t));
+
+    // 检查数据统计
+    const stats = {};
+    for (const table of existingTables) {
+      if (expectedTables.includes(table)) {
+        try {
+          const count = await env.DB.prepare(`SELECT COUNT(*) as count FROM ${table}`).first();
+          stats[table] = count.count;
+        } catch (error) {
+          stats[table] = 'error';
+        }
+      }
+    }
+
+    return new Response(JSON.stringify({
+      status: 'healthy',
+      database: {
+        connected: true,
+        initialized: initStatus.database_initialized?.value === 'true',
+        initialization_info: initStatus,
+        tables: existingTables,
+        missingTables: missingTables,
+        stats: stats
+      },
+      timestamp: new Date().toISOString()
+    }), {
+      headers: { 'Content-Type': 'application/json', ...corsHeaders }
+    });
+
+  } catch (error) {
+    console.error('健康检查失败:', error);
+    return new Response(JSON.stringify({
+      status: 'unhealthy',
+      error: error.message,
+      timestamp: new Date().toISOString()
+    }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json', ...corsHeaders }
+    });
   }
 }
 
@@ -288,9 +477,14 @@ async function handleOAuthLogin(request, env, corsHeaders) {
     authUrl.searchParams.set('state', state);
 
     // 保存state到数据库
-    await env.DB.prepare(`
-      INSERT INTO oauth_states (state, expires_at) VALUES (?, ?)
-    `).bind(state, expiresAt).run();
+    try {
+      await env.DB.prepare(`
+        INSERT INTO oauth_states (state, expires_at) VALUES (?, ?)
+      `).bind(state, expiresAt).run();
+    } catch (error) {
+      console.error('保存OAuth状态失败:', error);
+      // 即使保存失败也继续，不影响登录流程
+    }
 
     console.log('Generated OAuth URL:', authUrl.toString());
 
@@ -337,20 +531,25 @@ async function handleOAuthCallback(request, env, corsHeaders) {
     });
   }
 
-  // 验证state
-  const stateResult = await env.DB.prepare(`
-    SELECT state FROM oauth_states WHERE state = ? AND expires_at > ?
-  `).bind(state, new Date().toISOString()).first();
+  // 验证state - 添加错误处理
+  try {
+    const stateResult = await env.DB.prepare(`
+      SELECT state FROM oauth_states WHERE state = ? AND expires_at > ?
+    `).bind(state, new Date().toISOString()).first();
 
-  if (!stateResult) {
-    return new Response(generateErrorPage('OAuth State 验证失败', '无效的 state 参数，可能是过期或被篡改'), {
-      status: 400,
-      headers: { 'Content-Type': 'text/html', ...corsHeaders }
-    });
+    if (!stateResult) {
+      return new Response(generateErrorPage('OAuth State 验证失败', '无效的 state 参数，可能是过期或被篡改'), {
+        status: 400,
+        headers: { 'Content-Type': 'text/html', ...corsHeaders }
+      });
+    }
+
+    // 删除已使用的state
+    await env.DB.prepare(`DELETE FROM oauth_states WHERE state = ?`).bind(state).run();
+  } catch (error) {
+    console.error('State验证失败:', error);
+    // 即使state验证失败，也继续OAuth流程，避免因数据库问题导致登录失败
   }
-
-  // 删除已使用的state
-  await env.DB.prepare(`DELETE FROM oauth_states WHERE state = ?`).bind(state).run();
 
   try {
     console.log('Exchanging code for token...');
@@ -411,18 +610,23 @@ async function handleOAuthCallback(request, env, corsHeaders) {
       });
     }
 
-    // 保存或更新用户信息
-    await env.DB.prepare(`
-      INSERT OR REPLACE INTO users (id, username, nickname, email, avatar, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).bind(
-      userData.id.toString(),
-      userData.username,
-      userData.nickname || userData.username,
-      userData.email || '',
-      userData.avatar_template || 'https://yanxuan.nosdn.127.net/233a2a8170847d3287ec058c51cf60a9.jpg',
-      new Date().toISOString()
-    ).run();
+    // 保存或更新用户信息 - 添加错误处理
+    try {
+      await env.DB.prepare(`
+        INSERT OR REPLACE INTO users (id, username, nickname, email, avatar, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).bind(
+        userData.id.toString(),
+        userData.username,
+        userData.nickname || userData.username,
+        userData.email || '',
+        userData.avatar_template || 'https://yanxuan.nosdn.127.net/233a2a8170847d3287ec058c51cf60a9.jpg',
+        new Date().toISOString()
+      ).run();
+    } catch (error) {
+      console.error('保存用户信息失败:', error);
+      // 用户信息保存失败不应该阻止登录
+    }
 
     // 创建会话令牌
     const sessionToken = generateRandomString(64);
@@ -437,11 +641,16 @@ async function handleOAuthCallback(request, env, corsHeaders) {
 
     const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(); // 7天后过期
 
-    // 保存会话
-    await env.DB.prepare(`
-      INSERT INTO sessions (token, user_id, user_data, expires_at)
-      VALUES (?, ?, ?, ?)
-    `).bind(sessionToken, userData.id.toString(), JSON.stringify(userSession), expiresAt).run();
+    // 保存会话 - 添加错误处理
+    try {
+      await env.DB.prepare(`
+        INSERT INTO sessions (token, user_id, user_data, expires_at)
+        VALUES (?, ?, ?, ?)
+      `).bind(sessionToken, userData.id.toString(), JSON.stringify(userSession), expiresAt).run();
+    } catch (error) {
+      console.error('保存会话失败:', error);
+      throw new Error('会话创建失败，请重试');
+    }
 
     console.log('Session created for user:', userData.username);
 
@@ -468,34 +677,41 @@ async function handleAuthVerify(request, env, corsHeaders) {
     });
   }
 
-  const session = await env.DB.prepare(`
-    SELECT user_data FROM sessions WHERE token = ? AND expires_at > ?
-  `).bind(token, new Date().toISOString()).first();
+  try {
+    const session = await env.DB.prepare(`
+      SELECT user_data FROM sessions WHERE token = ? AND expires_at > ?
+    `).bind(token, new Date().toISOString()).first();
 
-  if (session) {
-    const userData = JSON.parse(session.user_data);
+    if (session) {
+      const userData = JSON.parse(session.user_data);
 
-    // 检查用户授权
-    if (env.OAUTH_ID && userData.userId !== env.OAUTH_ID) {
+      // 检查用户授权
+      if (env.OAUTH_ID && userData.userId !== env.OAUTH_ID) {
+        return new Response(JSON.stringify({ 
+          authenticated: false,
+          error: 'Unauthorized user'
+        }), {
+          headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        });
+      }
+
       return new Response(JSON.stringify({ 
-        authenticated: false,
-        error: 'Unauthorized user'
+        authenticated: true, 
+        user: userData 
       }), {
         headers: { 'Content-Type': 'application/json', ...corsHeaders }
       });
     }
 
-    return new Response(JSON.stringify({ 
-      authenticated: true, 
-      user: userData 
-    }), {
+    return new Response(JSON.stringify({ authenticated: false }), {
+      headers: { 'Content-Type': 'application/json', ...corsHeaders }
+    });
+  } catch (error) {
+    console.error('Auth verification error:', error);
+    return new Response(JSON.stringify({ authenticated: false }), {
       headers: { 'Content-Type': 'application/json', ...corsHeaders }
     });
   }
-
-  return new Response(JSON.stringify({ authenticated: false }), {
-    headers: { 'Content-Type': 'application/json', ...corsHeaders }
-  });
 }
 
 // 获取用户信息API
@@ -524,7 +740,12 @@ async function handleLogout(request, env, corsHeaders) {
   const token = request.headers.get('Authorization')?.replace('Bearer ', '');
 
   if (token) {
-    await env.DB.prepare(`DELETE FROM sessions WHERE token = ?`).bind(token).run();
+    try {
+      await env.DB.prepare(`DELETE FROM sessions WHERE token = ?`).bind(token).run();
+    } catch (error) {
+      console.error('Logout error:', error);
+      // 登出失败不应该影响前端清理
+    }
   }
 
   return new Response(JSON.stringify({ success: true }), {
@@ -534,41 +755,46 @@ async function handleLogout(request, env, corsHeaders) {
 
 // 密码历史记录功能
 async function savePasswordHistory(existingPassword, userId, env) {
-  const historyEntry = {
-    id: generateId(),
-    passwordId: existingPassword.id,
-    oldPassword: existingPassword.password, // 已加密
-    changedAt: new Date().toISOString(),
-    reason: 'password_update'
-  };
+  try {
+    const historyEntry = {
+      id: generateId(),
+      passwordId: existingPassword.id,
+      oldPassword: existingPassword.password, // 已加密
+      changedAt: new Date().toISOString(),
+      reason: 'password_update'
+    };
 
-  // 保存到历史记录
-  await env.DB.prepare(`
-    INSERT INTO password_history (id, password_id, user_id, old_password, changed_at, reason)
-    VALUES (?, ?, ?, ?, ?, ?)
-  `).bind(
-    historyEntry.id,
-    historyEntry.passwordId,
-    userId,
-    historyEntry.oldPassword,
-    historyEntry.changedAt,
-    historyEntry.reason
-  ).run();
-
-  // 只保留最近5次历史记录
-  const oldHistories = await env.DB.prepare(`
-    SELECT id FROM password_history 
-    WHERE password_id = ? AND user_id = ? 
-    ORDER BY changed_at DESC 
-    LIMIT -1 OFFSET 5
-  `).bind(historyEntry.passwordId, userId).all();
-
-  if (oldHistories.results.length > 0) {
-    const idsToDelete = oldHistories.results.map(h => h.id);
-    const placeholders = idsToDelete.map(() => '?').join(',');
+    // 保存到历史记录
     await env.DB.prepare(`
-      DELETE FROM password_history WHERE id IN (${placeholders})
-    `).bind(...idsToDelete).run();
+      INSERT INTO password_history (id, password_id, user_id, old_password, changed_at, reason)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).bind(
+      historyEntry.id,
+      historyEntry.passwordId,
+      userId,
+      historyEntry.oldPassword,
+      historyEntry.changedAt,
+      historyEntry.reason
+    ).run();
+
+    // 只保留最近5次历史记录
+    const oldHistories = await env.DB.prepare(`
+      SELECT id FROM password_history 
+      WHERE password_id = ? AND user_id = ? 
+      ORDER BY changed_at DESC 
+      LIMIT -1 OFFSET 5
+    `).bind(historyEntry.passwordId, userId).all();
+
+    if (oldHistories.results.length > 0) {
+      const idsToDelete = oldHistories.results.map(h => h.id);
+      const placeholders = idsToDelete.map(() => '?').join(',');
+      await env.DB.prepare(`
+        DELETE FROM password_history WHERE id IN (${placeholders})
+      `).bind(...idsToDelete).run();
+    }
+  } catch (error) {
+    console.error('保存密码历史失败:', error);
+    // 历史记录保存失败不应该影响密码更新
   }
 }
 
@@ -757,7 +983,7 @@ async function handleDeletePasswordHistory(request, env, corsHeaders) {
   }
 }
 
-// 密码条目处理
+// 修复后的密码处理函数 - 修正编辑时密码验证逻辑
 async function handlePasswords(request, env, corsHeaders) {
   const session = await verifySession(request, env);
   if (!session) {
@@ -770,6 +996,8 @@ async function handlePasswords(request, env, corsHeaders) {
   const url = new URL(request.url);
   const id = url.pathname.split('/').pop();
   const userId = session.userId;
+
+  console.log(`处理密码请求: 方法=${request.method}, 用户ID=${userId}, 密码ID=${id}`);
 
   // 获取分页参数
   const page = parseInt(url.searchParams.get('page')) || 1;
@@ -896,10 +1124,29 @@ async function handlePasswords(request, env, corsHeaders) {
     case 'POST':
       try {
         const newPassword = await request.json();
+        console.log('接收到新密码数据:', {
+          siteName: newPassword.siteName,
+          username: newPassword.username,
+          hasPassword: !!newPassword.password,
+          category: newPassword.category,
+          url: newPassword.url
+        });
+        
+        // 验证必填字段
+        if (!newPassword.siteName || !newPassword.username || !newPassword.password) {
+          return new Response(JSON.stringify({
+            error: '缺少必填字段',
+            message: '网站名称、用户名和密码为必填项'
+          }), {
+            status: 400,
+            headers: { 'Content-Type': 'application/json', ...corsHeaders }
+          });
+        }
         
         // 检查重复
         const duplicateCheck = await checkForDuplicates(newPassword, userId, env, true);
         if (duplicateCheck.isDuplicate) {
+          console.log('检测到重复密码');
           if (duplicateCheck.isIdentical) {
             return new Response(JSON.stringify({
               error: '检测到完全相同的账户',
@@ -937,34 +1184,66 @@ async function handlePasswords(request, env, corsHeaders) {
             const urlObj = new URL(newPassword.url);
             newPassword.siteName = urlObj.hostname.replace('www.', '');
           } catch (e) {
-            // 忽略URL解析错误
+            console.log('URL解析失败:', e.message);
           }
         }
         
+        console.log('开始加密密码...');
         const encryptedPassword = await encryptPassword(newPassword.password, userId);
+        console.log('密码加密完成');
         
-        await env.DB.prepare(`
-          INSERT INTO passwords (id, user_id, site_name, username, password, url, category, notes, created_at, updated_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `).bind(
+        console.log('准备插入数据库:', {
           passwordId,
           userId,
-          newPassword.siteName,
-          newPassword.username,
-          encryptedPassword,
-          newPassword.url || null,
-          newPassword.category || null,
-          newPassword.notes || null,
-          now,
-          now
-        ).run();
+          siteName: newPassword.siteName,
+          username: newPassword.username,
+          category: newPassword.category
+        });
         
-        // 添加分类（如果不存在）
-        if (newPassword.category) {
-          await env.DB.prepare(`
-            INSERT OR IGNORE INTO categories (user_id, name) VALUES (?, ?)
-          `).bind(userId, newPassword.category).run();
+        // 执行数据库插入 - 添加错误处理和调试
+        try {
+          const insertResult = await env.DB.prepare(`
+            INSERT INTO passwords (id, user_id, site_name, username, password, url, category, notes, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `).bind(
+            passwordId,
+            userId,
+            newPassword.siteName,
+            newPassword.username,
+            encryptedPassword,
+            newPassword.url || null,
+            newPassword.category || null,
+            newPassword.notes || null,
+            now,
+            now
+          ).run();
+          
+          console.log('数据库插入结果:', insertResult);
+          
+          if (!insertResult.success) {
+            throw new Error('数据库插入失败: ' + JSON.stringify(insertResult));
+          }
+          
+        } catch (dbError) {
+          console.error('数据库插入错误:', dbError);
+          throw new Error('数据库插入失败: ' + dbError.message);
         }
+        
+        // 添加分类（如果不存在且不为空）
+        if (newPassword.category && newPassword.category.trim()) {
+          console.log('添加新分类:', newPassword.category);
+          try {
+            const categoryResult = await env.DB.prepare(`
+              INSERT OR IGNORE INTO categories (user_id, name, created_at, updated_at) VALUES (?, ?, ?, ?)
+            `).bind(userId, newPassword.category.trim(), now, now).run();
+            console.log('分类添加结果:', categoryResult);
+          } catch (catError) {
+            console.error('分类添加错误:', catError);
+            // 分类添加失败不影响密码保存
+          }
+        }
+        
+        console.log('密码保存成功');
         
         const responseData = {
           id: passwordId,
@@ -982,10 +1261,12 @@ async function handlePasswords(request, env, corsHeaders) {
           headers: { 'Content-Type': 'application/json', ...corsHeaders }
         });
       } catch (error) {
-        console.error('创建密码失败:', error);
+        console.error('❌ 创建密码失败:', error);
+        console.error('错误堆栈:', error.stack);
         return new Response(JSON.stringify({ 
           error: '创建密码失败',
-          message: error.message 
+          message: error.message,
+          details: error.stack
         }), {
           status: 500,
           headers: { 'Content-Type': 'application/json', ...corsHeaders }
@@ -1015,8 +1296,19 @@ async function handlePasswords(request, env, corsHeaders) {
         const updateData = await request.json();
         const now = new Date().toISOString();
         
+        // 验证必填字段（编辑时网站名称和用户名仍然必填）
+        if (!updateData.siteName || !updateData.username) {
+          return new Response(JSON.stringify({
+            error: '缺少必填字段',
+            message: '网站名称和用户名为必填项'
+          }), {
+            status: 400,
+            headers: { 'Content-Type': 'application/json', ...corsHeaders }
+          });
+        }
+        
         // 如果密码发生变更，保存历史记录
-        if (updateData.password) {
+        if (updateData.password && updateData.password.trim()) {
           const newEncryptedPassword = await encryptPassword(updateData.password, userId);
           const oldDecryptedPassword = await decryptPassword(existingPassword.password, userId);
           
@@ -1026,36 +1318,62 @@ async function handlePasswords(request, env, corsHeaders) {
           }
           
           updateData.password = newEncryptedPassword;
+        } else {
+          // 如果密码为空，则不更新密码字段
+          delete updateData.password;
         }
+        
+        // 构建更新查询
+        const updateFields = [];
+        const updateValues = [];
+        
+        if (updateData.siteName) {
+          updateFields.push('site_name = ?');
+          updateValues.push(updateData.siteName);
+        }
+        
+        if (updateData.username) {
+          updateFields.push('username = ?');
+          updateValues.push(updateData.username);
+        }
+        
+        if (updateData.password) {
+          updateFields.push('password = ?');
+          updateValues.push(updateData.password);
+        }
+        
+        updateFields.push('url = ?');
+        updateValues.push(updateData.url || null);
+        
+        updateFields.push('category = ?');
+        updateValues.push(updateData.category || null);
+        
+        updateFields.push('notes = ?');
+        updateValues.push(updateData.notes || null);
+        
+        updateFields.push('updated_at = ?');
+        updateValues.push(now);
+        
+        // 添加WHERE条件的参数
+        updateValues.push(id, userId);
         
         // 更新密码
         await env.DB.prepare(`
           UPDATE passwords 
-          SET site_name = COALESCE(?, site_name),
-              username = COALESCE(?, username),
-              password = COALESCE(?, password),
-              url = ?,
-              category = ?,
-              notes = ?,
-              updated_at = ?
+          SET ${updateFields.join(', ')}
           WHERE id = ? AND user_id = ?
-        `).bind(
-          updateData.siteName || null,
-          updateData.username || null,
-          updateData.password || null,
-          updateData.url || null,
-          updateData.category || null,
-          updateData.notes || null,
-          now,
-          id,
-          userId
-        ).run();
+        `).bind(...updateValues).run();
 
-        // 添加分类（如果不存在）
-        if (updateData.category) {
-          await env.DB.prepare(`
-            INSERT OR IGNORE INTO categories (user_id, name) VALUES (?, ?)
-          `).bind(userId, updateData.category).run();
+        // 添加分类（如果不存在且不为空）
+        if (updateData.category && updateData.category.trim()) {
+          try {
+            await env.DB.prepare(`
+              INSERT OR IGNORE INTO categories (user_id, name, created_at, updated_at) VALUES (?, ?, ?, ?)
+            `).bind(userId, updateData.category.trim(), now, now).run();
+          } catch (error) {
+            console.error('添加分类失败:', error);
+            // 分类添加失败不影响密码更新
+          }
         }
         
         const updatedPassword = await env.DB.prepare(`
@@ -1292,7 +1610,7 @@ async function handleUpdateExistingPassword(request, env, corsHeaders) {
   }
 }
 
-// 获取实际密码
+// 获取实际密码 - 修正版本，增强错误处理
 async function getActualPassword(request, env, corsHeaders) {
   const session = await verifySession(request, env);
   if (!session) {
@@ -1308,18 +1626,23 @@ async function getActualPassword(request, env, corsHeaders) {
   const userId = session.userId;
 
   try {
+    console.log('获取密码请求:', { passwordId: id, userId });
+    
     const password = await env.DB.prepare(`
       SELECT password FROM passwords WHERE id = ? AND user_id = ?
     `).bind(id, userId).first();
 
     if (!password) {
-      return new Response(JSON.stringify({ error: '未找到' }), {
+      console.log('密码未找到:', { passwordId: id, userId });
+      return new Response(JSON.stringify({ error: '未找到密码' }), {
         status: 404,
         headers: { 'Content-Type': 'application/json', ...corsHeaders }
       });
     }
 
+    console.log('开始解密密码...');
     const decryptedPassword = await decryptPassword(password.password, userId);
+    console.log('密码解密成功');
 
     return new Response(JSON.stringify({ password: decryptedPassword }), {
       headers: { 'Content-Type': 'application/json', ...corsHeaders }
@@ -1328,7 +1651,8 @@ async function getActualPassword(request, env, corsHeaders) {
     console.error('获取密码失败:', error);
     return new Response(JSON.stringify({ 
       error: '获取密码失败',
-      message: error.message 
+      message: error.message,
+      details: error.stack
     }), {
       status: 500,
       headers: { 'Content-Type': 'application/json', ...corsHeaders }
@@ -1336,7 +1660,7 @@ async function getActualPassword(request, env, corsHeaders) {
   }
 }
 
-// 分类管理
+// 分类管理 - 增强版本，支持完整的CRUD操作
 async function handleCategories(request, env, corsHeaders) {
   const session = await verifySession(request, env);
   if (!session) {
@@ -1347,40 +1671,383 @@ async function handleCategories(request, env, corsHeaders) {
   }
 
   const userId = session.userId;
+  const url = new URL(request.url);
+  const pathParts = url.pathname.split('/');
+  const categoryId = pathParts[pathParts.length - 1];
+
+  console.log(`处理分类请求: 方法=${request.method}, 用户ID=${userId}, 分类ID=${categoryId}`);
 
   if (request.method === 'GET') {
-    const categories = await env.DB.prepare(`
-      SELECT name FROM categories WHERE user_id = ? ORDER BY name
-    `).bind(userId).all();
+    try {
+      // 如果有具体的分类ID，返回单个分类详情
+      if (categoryId && categoryId !== 'categories' && !isNaN(categoryId)) {
+        const category = await env.DB.prepare(`
+          SELECT * FROM categories WHERE id = ? AND user_id = ?
+        `).bind(categoryId, userId).first();
 
-    return new Response(JSON.stringify(categories.results.map(c => c.name)), {
-      headers: { 'Content-Type': 'application/json', ...corsHeaders }
-    });
+        if (!category) {
+          return new Response(JSON.stringify({ error: '分类不存在' }), {
+            status: 404,
+            headers: { 'Content-Type': 'application/json', ...corsHeaders }
+          });
+        }
+
+        // 获取该分类下的密码数量
+        const passwordCount = await env.DB.prepare(`
+          SELECT COUNT(*) as count FROM passwords WHERE category = ? AND user_id = ?
+        `).bind(category.name, userId).first();
+
+        return new Response(JSON.stringify({
+          id: category.id,
+          name: category.name,
+          description: category.description,
+          color: category.color,
+          icon: category.icon,
+          passwordCount: passwordCount.count,
+          createdAt: category.created_at,
+          updatedAt: category.updated_at
+        }), {
+          headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        });
+      } else {
+        // 返回所有分类列表
+        const categories = await env.DB.prepare(`
+          SELECT c.*, COUNT(p.id) as password_count 
+          FROM categories c 
+          LEFT JOIN passwords p ON c.name = p.category AND c.user_id = p.user_id 
+          WHERE c.user_id = ? 
+          GROUP BY c.id, c.name 
+          ORDER BY c.name
+        `).bind(userId).all();
+
+        const formattedCategories = categories.results.map(cat => ({
+          id: cat.id,
+          name: cat.name,
+          description: cat.description,
+          color: cat.color,
+          icon: cat.icon,
+          passwordCount: cat.password_count || 0,
+          createdAt: cat.created_at,
+          updatedAt: cat.updated_at
+        }));
+
+        console.log(`获取到 ${formattedCategories.length} 个分类`);
+
+        return new Response(JSON.stringify(formattedCategories), {
+          headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        });
+      }
+    } catch (error) {
+      console.error('获取分类失败:', error);
+      return new Response(JSON.stringify({ 
+        error: '获取分类失败',
+        message: error.message 
+      }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json', ...corsHeaders }
+      });
+    }
   }
 
   if (request.method === 'POST') {
-    const { action, category } = await request.json();
+    try {
+      const { action, category, description, color, icon } = await request.json();
+      console.log('分类操作请求:', { action, category, description, color, icon });
 
-    if (action === 'add' && category) {
-      await env.DB.prepare(`
-        INSERT OR IGNORE INTO categories (user_id, name) VALUES (?, ?)
-      `).bind(userId, category).run();
-    } else if (action === 'remove' && category) {
-      await env.DB.prepare(`
-        DELETE FROM categories WHERE user_id = ? AND name = ?
-      `).bind(userId, category).run();
+      if (action === 'add' && category && category.trim()) {
+        const categoryName = category.trim();
+        const now = new Date().toISOString();
+
+        // 检查分类是否已存在
+        const existingCategory = await env.DB.prepare(`
+          SELECT id FROM categories WHERE user_id = ? AND name = ?
+        `).bind(userId, categoryName).first();
+
+        if (existingCategory) {
+          return new Response(JSON.stringify({ 
+            error: '分类已存在',
+            message: `分类 "${categoryName}" 已经存在`
+          }), {
+            status: 409,
+            headers: { 'Content-Type': 'application/json', ...corsHeaders }
+          });
+        }
+
+        // 创建新分类 - 添加错误处理
+        try {
+          const result = await env.DB.prepare(`
+            INSERT INTO categories (user_id, name, description, color, icon, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+          `).bind(
+            userId, 
+            categoryName, 
+            description || null, 
+            color || '#6366f1', 
+            icon || 'fas fa-folder',
+            now,
+            now
+          ).run();
+
+          console.log('分类创建结果:', result);
+
+          if (!result.success) {
+            throw new Error('数据库插入失败: ' + JSON.stringify(result));
+          }
+
+          // 获取新创建的分类信息
+          const newCategory = await env.DB.prepare(`
+            SELECT * FROM categories WHERE id = ?
+          `).bind(result.meta.last_row_id).first();
+
+          return new Response(JSON.stringify({
+            success: true,
+            message: `分类 "${categoryName}" 已创建`,
+            category: {
+              id: newCategory.id,
+              name: newCategory.name,
+              description: newCategory.description,
+              color: newCategory.color,
+              icon: newCategory.icon,
+              passwordCount: 0,
+              createdAt: newCategory.created_at,
+              updatedAt: newCategory.updated_at
+            }
+          }), {
+            headers: { 'Content-Type': 'application/json', ...corsHeaders }
+          });
+        } catch (dbError) {
+          console.error('分类数据库插入错误:', dbError);
+          throw new Error('分类创建失败: ' + dbError.message);
+        }
+
+      } else if (action === 'remove' && category) {
+        // 检查分类下是否有密码
+        const passwordCount = await env.DB.prepare(`
+          SELECT COUNT(*) as count FROM passwords WHERE category = ? AND user_id = ?
+        `).bind(category, userId).first();
+
+        if (passwordCount.count > 0) {
+          return new Response(JSON.stringify({ 
+            error: '无法删除',
+            message: `分类 "${category}" 下还有 ${passwordCount.count} 个密码，请先移动或删除这些密码`
+          }), {
+            status: 409,
+            headers: { 'Content-Type': 'application/json', ...corsHeaders }
+          });
+        }
+
+        // 删除分类
+        const result = await env.DB.prepare(`
+          DELETE FROM categories WHERE user_id = ? AND name = ?
+        `).bind(userId, category).run();
+
+        if (result.changes === 0) {
+          return new Response(JSON.stringify({ 
+            error: '分类不存在',
+            message: `分类 "${category}" 不存在或已被删除`
+          }), {
+            status: 404,
+            headers: { 'Content-Type': 'application/json', ...corsHeaders }
+          });
+        }
+
+        return new Response(JSON.stringify({
+          success: true,
+          message: `分类 "${category}" 已删除`
+        }), {
+          headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        });
+
+      } else {
+        return new Response(JSON.stringify({ 
+          error: '无效的操作或参数',
+          message: '请提供有效的 action 和 category 参数'
+        }), {
+          status: 400,
+          headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        });
+      }
+    } catch (error) {
+      console.error('分类操作失败:', error);
+      return new Response(JSON.stringify({ 
+        error: '分类操作失败',
+        message: error.message 
+      }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json', ...corsHeaders }
+      });
+    }
+  }
+
+  if (request.method === 'PUT') {
+    // 更新分类
+    if (!categoryId || categoryId === 'categories' || isNaN(categoryId)) {
+      return new Response(JSON.stringify({ error: '缺少有效的分类ID' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json', ...corsHeaders }
+      });
     }
 
-    const categories = await env.DB.prepare(`
-      SELECT name FROM categories WHERE user_id = ? ORDER BY name
-    `).bind(userId).all();
+    try {
+      const { name, description, color, icon } = await request.json();
 
-    return new Response(JSON.stringify({ 
-      success: true, 
-      categories: categories.results.map(c => c.name) 
-    }), {
-      headers: { 'Content-Type': 'application/json', ...corsHeaders }
-    });
+      if (!name || !name.trim()) {
+        return new Response(JSON.stringify({ error: '分类名称不能为空' }), {
+          status: 400,
+          headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        });
+      }
+
+      const categoryName = name.trim();
+      const now = new Date().toISOString();
+
+      // 检查分类是否存在
+      const existingCategory = await env.DB.prepare(`
+        SELECT * FROM categories WHERE id = ? AND user_id = ?
+      `).bind(categoryId, userId).first();
+
+      if (!existingCategory) {
+        return new Response(JSON.stringify({ error: '分类不存在' }), {
+          status: 404,
+          headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        });
+      }
+
+      // 如果名称发生变化，检查新名称是否已存在
+      if (existingCategory.name !== categoryName) {
+        const duplicateCategory = await env.DB.prepare(`
+          SELECT id FROM categories WHERE user_id = ? AND name = ? AND id != ?
+        `).bind(userId, categoryName, categoryId).first();
+
+        if (duplicateCategory) {
+          return new Response(JSON.stringify({ 
+            error: '分类名称已存在',
+            message: `分类 "${categoryName}" 已经存在`
+          }), {
+            status: 409,
+            headers: { 'Content-Type': 'application/json', ...corsHeaders }
+          });
+        }
+
+        // 更新相关密码的分类名称
+        await env.DB.prepare(`
+          UPDATE passwords SET category = ? WHERE category = ? AND user_id = ?
+        `).bind(categoryName, existingCategory.name, userId).run();
+      }
+
+      // 更新分类信息
+      await env.DB.prepare(`
+        UPDATE categories 
+        SET name = ?, description = ?, color = ?, icon = ?, updated_at = ?
+        WHERE id = ? AND user_id = ?
+      `).bind(
+        categoryName,
+        description || null,
+        color || existingCategory.color,
+        icon || existingCategory.icon,
+        now,
+        categoryId,
+        userId
+      ).run();
+
+      // 获取更新后的分类信息
+      const updatedCategory = await env.DB.prepare(`
+        SELECT * FROM categories WHERE id = ? AND user_id = ?
+      `).bind(categoryId, userId).first();
+
+      // 获取密码数量
+      const passwordCount = await env.DB.prepare(`
+        SELECT COUNT(*) as count FROM passwords WHERE category = ? AND user_id = ?
+      `).bind(updatedCategory.name, userId).first();
+
+      return new Response(JSON.stringify({
+        success: true,
+        message: `分类 "${categoryName}" 已更新`,
+        category: {
+          id: updatedCategory.id,
+          name: updatedCategory.name,
+          description: updatedCategory.description,
+          color: updatedCategory.color,
+          icon: updatedCategory.icon,
+          passwordCount: passwordCount.count,
+          createdAt: updatedCategory.created_at,
+          updatedAt: updatedCategory.updated_at
+        }
+      }), {
+        headers: { 'Content-Type': 'application/json', ...corsHeaders }
+      });
+
+    } catch (error) {
+      console.error('更新分类失败:', error);
+      return new Response(JSON.stringify({ 
+        error: '更新分类失败',
+        message: error.message 
+      }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json', ...corsHeaders }
+      });
+    }
+  }
+
+  if (request.method === 'DELETE') {
+    // 删除分类
+    if (!categoryId || categoryId === 'categories' || isNaN(categoryId)) {
+      return new Response(JSON.stringify({ error: '缺少有效的分类ID' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json', ...corsHeaders }
+      });
+    }
+
+    try {
+      // 获取分类信息
+      const category = await env.DB.prepare(`
+        SELECT * FROM categories WHERE id = ? AND user_id = ?
+      `).bind(categoryId, userId).first();
+
+      if (!category) {
+        return new Response(JSON.stringify({ error: '分类不存在' }), {
+          status: 404,
+          headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        });
+      }
+
+      // 检查分类下是否有密码
+      const passwordCount = await env.DB.prepare(`
+        SELECT COUNT(*) as count FROM passwords WHERE category = ? AND user_id = ?
+      `).bind(category.name, userId).first();
+
+      if (passwordCount.count > 0) {
+        return new Response(JSON.stringify({ 
+          error: '无法删除',
+          message: `分类 "${category.name}" 下还有 ${passwordCount.count} 个密码，请先移动或删除这些密码`
+        }), {
+          status: 409,
+          headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        });
+      }
+
+      // 删除分类
+      await env.DB.prepare(`
+        DELETE FROM categories WHERE id = ? AND user_id = ?
+      `).bind(categoryId, userId).run();
+
+      return new Response(JSON.stringify({
+        success: true,
+        message: `分类 "${category.name}" 已删除`
+      }), {
+        headers: { 'Content-Type': 'application/json', ...corsHeaders }
+      });
+
+    } catch (error) {
+      console.error('删除分类失败:', error);
+      return new Response(JSON.stringify({ 
+        error: '删除分类失败',
+        message: error.message 
+      }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json', ...corsHeaders }
+      });
+    }
   }
 
   return new Response('Method not allowed', { status: 405, headers: corsHeaders });
@@ -1527,11 +2194,16 @@ async function handleEncryptedImport(request, env, corsHeaders) {
           now
         ).run();
 
-        // 添加分类（如果不存在）
-        if (passwordData.category) {
-          await env.DB.prepare(`
-            INSERT OR IGNORE INTO categories (user_id, name) VALUES (?, ?)
-          `).bind(userId, passwordData.category).run();
+        // 添加分类（如果不存在且不为空）
+        if (passwordData.category && passwordData.category.trim()) {
+          try {
+            await env.DB.prepare(`
+              INSERT OR IGNORE INTO categories (user_id, name, created_at, updated_at) VALUES (?, ?, ?, ?)
+            `).bind(userId, passwordData.category.trim(), now, now).run();
+          } catch (error) {
+            console.error('添加分类失败:', error);
+            // 分类添加失败不影响密码导入
+          }
         }
         
         imported++;
@@ -1588,38 +2260,53 @@ async function handleWebDAVConfig(request, env, corsHeaders, session) {
   const userId = session.userId;
 
   if (request.method === 'GET') {
-    const config = await env.DB.prepare(`
-      SELECT * FROM webdav_configs WHERE user_id = ?
-    `).bind(userId).first();
+    try {
+      const config = await env.DB.prepare(`
+        SELECT * FROM webdav_configs WHERE user_id = ?
+      `).bind(userId).first();
 
-    if (config) {
-      const decryptedConfig = {
-        webdavUrl: config.webdav_url,
-        username: config.username,
-        password: await decryptPassword(config.password, userId)
-      };
-      return new Response(JSON.stringify(decryptedConfig), {
+      if (config) {
+        const decryptedConfig = {
+          webdavUrl: config.webdav_url,
+          username: config.username,
+          password: await decryptPassword(config.password, userId)
+        };
+        return new Response(JSON.stringify(decryptedConfig), {
+          headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        });
+      }
+      return new Response(JSON.stringify({}), {
+        headers: { 'Content-Type': 'application/json', ...corsHeaders }
+      });
+    } catch (error) {
+      console.error('获取WebDAV配置失败:', error);
+      return new Response(JSON.stringify({}), {
         headers: { 'Content-Type': 'application/json', ...corsHeaders }
       });
     }
-    return new Response(JSON.stringify({}), {
-      headers: { 'Content-Type': 'application/json', ...corsHeaders }
-    });
   }
 
   if (request.method === 'POST') {
-    const config = await request.json();
-    const encryptedPassword = await encryptPassword(config.password, userId);
-    const now = new Date().toISOString();
+    try {
+      const config = await request.json();
+      const encryptedPassword = await encryptPassword(config.password, userId);
+      const now = new Date().toISOString();
 
-    await env.DB.prepare(`
-      INSERT OR REPLACE INTO webdav_configs (user_id, webdav_url, username, password, updated_at)
-      VALUES (?, ?, ?, ?, ?)
-    `).bind(userId, config.webdavUrl, config.username, encryptedPassword, now).run();
+      await env.DB.prepare(`
+        INSERT OR REPLACE INTO webdav_configs (user_id, webdav_url, username, password, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+      `).bind(userId, config.webdavUrl, config.username, encryptedPassword, now).run();
 
-    return new Response(JSON.stringify({ success: true }), {
-      headers: { 'Content-Type': 'application/json', ...corsHeaders }
-    });
+      return new Response(JSON.stringify({ success: true }), {
+        headers: { 'Content-Type': 'application/json', ...corsHeaders }
+      });
+    } catch (error) {
+      console.error('保存WebDAV配置失败:', error);
+      return new Response(JSON.stringify({ error: '保存配置失败' }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json', ...corsHeaders }
+      });
+    }
   }
 
   return new Response('Method not allowed', { status: 405, headers: corsHeaders });
@@ -1855,11 +2542,16 @@ async function handleWebDAVRestore(request, env, corsHeaders, session) {
           now
         ).run();
 
-        // 添加分类（如果不存在）
-        if (passwordData.category) {
-          await env.DB.prepare(`
-            INSERT OR IGNORE INTO categories (user_id, name) VALUES (?, ?)
-          `).bind(userId, passwordData.category).run();
+        // 添加分类（如果不存在且不为空）
+        if (passwordData.category && passwordData.category.trim()) {
+          try {
+            await env.DB.prepare(`
+              INSERT OR IGNORE INTO categories (user_id, name, created_at, updated_at) VALUES (?, ?, ?, ?)
+            `).bind(userId, passwordData.category.trim(), now, now).run();
+          } catch (error) {
+            console.error('添加分类失败:', error);
+            // 分类添加失败不影响密码恢复
+          }
         }
         
         imported++;
@@ -2067,9 +2759,14 @@ async function handleDetectLogin(request, env, corsHeaders) {
     ).run();
 
     // 添加分类
-    await env.DB.prepare(`
-      INSERT OR IGNORE INTO categories (user_id, name) VALUES (?, ?)
-    `).bind(userId, '自动保存').run();
+    try {
+      await env.DB.prepare(`
+        INSERT OR IGNORE INTO categories (user_id, name, created_at, updated_at) VALUES (?, ?, ?, ?)
+      `).bind(userId, '自动保存', now, now).run();
+    } catch (error) {
+      console.error('添加分类失败:', error);
+      // 分类添加失败不影响密码保存
+    }
 
     return new Response(JSON.stringify({ 
       exists: false, 
@@ -2130,7 +2827,7 @@ async function handleAutoFill(request, env, corsHeaders) {
       if (password.url) {
         try {
           const savedUrlObj = new URL(password.url);
-          const savedDomain = savedUrlObj.hostname.replace('www.', '');
+          const savedDomain = savedUrlObj.hostname.replace('www.', '').toLowerCase();
           
           // 精确域名匹配
           if (savedDomain === domain) {
@@ -2216,20 +2913,25 @@ async function verifySession(request, env) {
   const token = request.headers.get('Authorization')?.replace('Bearer ', '');
   if (!token) return null;
 
-  const session = await env.DB.prepare(`
-    SELECT user_data FROM sessions WHERE token = ? AND expires_at > ?
-  `).bind(token, new Date().toISOString()).first();
+  try {
+    const session = await env.DB.prepare(`
+      SELECT user_data FROM sessions WHERE token = ? AND expires_at > ?
+    `).bind(token, new Date().toISOString()).first();
 
-  if (!session) return null;
+    if (!session) return null;
 
-  const userData = JSON.parse(session.user_data);
+    const userData = JSON.parse(session.user_data);
 
-  // 检查用户授权
-  if (env.OAUTH_ID && userData.userId !== env.OAUTH_ID) {
+    // 检查用户授权
+    if (env.OAUTH_ID && userData.userId !== env.OAUTH_ID) {
+      return null;
+    }
+
+    return userData;
+  } catch (error) {
+    console.error('Session verification error:', error);
     return null;
   }
-
-  return userData;
 }
 
 async function encryptPassword(password, userId) {
@@ -2273,6 +2975,7 @@ async function decryptPassword(encryptedPassword, userId) {
 
     return new TextDecoder().decode(decrypted);
   } catch (error) {
+    console.error('密码解密失败:', error);
     return encryptedPassword;
   }
 }
@@ -2468,7 +3171,7 @@ function generateSuccessPage(userSession, sessionToken) {
   </html>`;
 }
 
-// HTML5界面（保持原样）
+// HTML5界面（修正版本）- 修改为卡片网格布局，将查看历史和编辑按钮移到右上角
 function getHTML5() {
   return `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -2838,14 +3541,15 @@ function getHTML5() {
             border-color: var(--primary-color);
         }
 
-        /* 密码网格 */
+        /* 密码网格容器 - 修改为每行三个卡片 */
         .passwords-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(23.75rem, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(380px, 1fr));
             gap: 1.5rem;
+            margin-bottom: 2rem;
         }
 
-        /* 密码卡片 */
+        /* 密码卡片 - 修改布局，将历史和编辑按钮移到右上角 */
         .password-card {
             background: var(--card-background);
             backdrop-filter: blur(20px);
@@ -2856,6 +3560,10 @@ function getHTML5() {
             position: relative;
             border: 1px solid rgba(255, 255, 255, 0.2);
             overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            height: auto;
+            min-height: 280px;
         }
 
         .password-card::before {
@@ -2875,9 +3583,24 @@ function getHTML5() {
 
         .password-header {
             display: flex;
+            align-items: flex-start;
+            justify-content: space-between;
+            margin-bottom: 1.5rem;
+        }
+
+        .password-header-left {
+            display: flex;
             align-items: center;
             gap: 1rem;
-            margin-bottom: 1.5rem;
+            flex: 1;
+            min-width: 0;
+        }
+
+        .password-header-right {
+            display: flex;
+            gap: 0.5rem;
+            flex-shrink: 0;
+            margin-left: 1rem;
         }
 
         .site-icon {
@@ -2891,6 +3614,12 @@ function getHTML5() {
             color: white;
             font-size: 1.5rem;
             box-shadow: var(--shadow-md);
+            flex-shrink: 0;
+        }
+
+        .password-meta {
+            flex: 1;
+            min-width: 0;
         }
 
         .password-meta h3 {
@@ -2898,6 +3627,9 @@ function getHTML5() {
             margin-bottom: 0.5rem;
             font-size: 1.25rem;
             font-weight: 700;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
         }
 
         .category-badge {
@@ -2911,7 +3643,8 @@ function getHTML5() {
         }
 
         .password-field {
-            margin: 1rem 0;
+            margin: 0.75rem 0;
+            flex: 1;
         }
 
         .password-field label {
@@ -2929,11 +3662,22 @@ function getHTML5() {
             font-size: 1rem;
             word-break: break-all;
             font-family: 'SF Mono', 'Monaco', 'Cascadia Code', monospace;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .password-field .value.url-value {
+            max-width: 100%;
         }
 
         .password-field .value a {
             color: var(--primary-color);
             text-decoration: none;
+            display: block;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
         }
 
         .password-field .value a:hover {
@@ -2941,16 +3685,41 @@ function getHTML5() {
         }
 
         .password-actions {
-            display: flex;
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
             gap: 0.5rem;
-            margin-top: 1.5rem;
-            flex-wrap: wrap;
+            margin-top: auto;
+            padding-top: 1rem;
         }
 
         .password-actions .btn {
-            flex: 1;
-            min-width: 3rem;
+            padding: 0.75rem 0.5rem;
             justify-content: center;
+            font-size: 0.875rem;
+            flex: 1;
+        }
+
+        /* 右上角快捷按钮 */
+        .quick-action-btn {
+            background: rgba(255, 255, 255, 0.9);
+            border: 1px solid var(--border-color);
+            border-radius: var(--border-radius-sm);
+            padding: 0.5rem;
+            cursor: pointer;
+            transition: all var(--transition-normal);
+            color: var(--text-secondary);
+            font-size: 0.875rem;
+            width: 2.5rem;
+            height: 2.5rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .quick-action-btn:hover {
+            background: var(--primary-color);
+            color: white;
+            transform: scale(1.1);
         }
 
         /* 密码历史记录模态框 */
@@ -3228,6 +3997,96 @@ function getHTML5() {
             color: var(--primary-color);
         }
 
+        /* 分类管理器 */
+        .category-manager {
+            background: linear-gradient(135deg, #f0f9ff, #e0f2fe);
+            padding: 1.5rem;
+            border-radius: var(--border-radius-lg);
+            margin-bottom: 1.5rem;
+            border: 2px solid #bae6fd;
+        }
+
+        .category-manager h4 {
+            color: var(--text-primary);
+            margin-bottom: 1rem;
+            font-size: 1.125rem;
+            font-weight: 700;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .category-form {
+            display: flex;
+            gap: 0.75rem;
+            margin-bottom: 1rem;
+            flex-wrap: wrap;
+            align-items: end;
+        }
+
+        .category-form .form-group {
+            margin-bottom: 0;
+            flex: 1;
+            min-width: 200px;
+        }
+
+        .category-list {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+            gap: 1rem;
+            margin-top: 1rem;
+        }
+
+        .category-item {
+            background: white;
+            border: 1px solid var(--border-color);
+            border-radius: var(--border-radius-md);
+            padding: 1rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            transition: all var(--transition-normal);
+        }
+
+        .category-item:hover {
+            box-shadow: var(--shadow-md);
+            transform: translateY(-2px);
+        }
+
+        .category-info {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+
+        .category-icon {
+            width: 2.5rem;
+            height: 2.5rem;
+            border-radius: var(--border-radius-sm);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-size: 1rem;
+        }
+
+        .category-details h5 {
+            color: var(--text-primary);
+            margin-bottom: 0.25rem;
+            font-size: 1rem;
+            font-weight: 600;
+        }
+
+        .category-meta {
+            color: var(--text-secondary);
+            font-size: 0.875rem;
+        }
+
+        .category-actions {
+            display: flex;
+            gap: 0.5rem;
+        }
+
         /* WebDAV配置 */
         .webdav-section {
             background: linear-gradient(135deg, #f0f9ff, #e0f2fe);
@@ -3375,6 +4234,12 @@ function getHTML5() {
         }
 
         /* 响应式设计 */
+        @media (max-width: 1200px) {
+            .passwords-grid {
+                grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
+            }
+        }
+
         @media (max-width: 768px) {
             .app-container { 
                 padding: 0.75rem; 
@@ -3403,11 +4268,45 @@ function getHTML5() {
                 grid-template-columns: 1fr;
             }
             
-            .password-actions {
+            .password-header {
                 flex-direction: column;
+                align-items: stretch;
+                gap: 1rem;
+            }
+
+            .password-header-left {
+                align-items: center;
+            }
+
+            .password-header-right {
+                justify-content: center;
+                margin-left: 0;
+            }
+            
+            .password-actions {
+                grid-template-columns: repeat(2, 1fr);
+                gap: 0.5rem;
+            }
+
+            .password-actions .btn {
+                padding: 0.6rem 0.4rem;
+                font-size: 0.8rem;
             }
 
             .generator-options {
+                grid-template-columns: 1fr;
+            }
+
+            .category-form {
+                flex-direction: column;
+                align-items: stretch;
+            }
+
+            .category-form .form-group {
+                min-width: auto;
+            }
+
+            .category-list {
                 grid-template-columns: 1fr;
             }
 
@@ -3534,6 +4433,9 @@ function getHTML5() {
             <div class="nav-tab" onclick="switchTab('add-password')">
                 <i class="fas fa-plus"></i> 添加密码
             </div>
+            <div class="nav-tab" onclick="switchTab('categories')">
+                <i class="fas fa-folder"></i> 分类管理
+            </div>
             <div class="nav-tab" onclick="switchTab('backup')">
                 <i class="fas fa-cloud"></i> 云备份
             </div>
@@ -3563,7 +4465,7 @@ function getHTML5() {
                 </div>
             </section>
 
-            <!-- 密码列表 -->
+            <!-- 密码网格 -->
             <main>
                 <section class="passwords-grid" id="passwordsGrid">
                     <!-- 密码卡片将在这里动态生成 -->
@@ -3593,15 +4495,18 @@ function getHTML5() {
                         <input type="text" id="username" class="form-control" required placeholder="your@email.com" autocomplete="username">
                     </div>
                     <div class="form-group">
-                        <label for="password">🔑 密码 *</label>
+                        <label for="password">🔑 密码 <span id="passwordRequiredIndicator">*</span></label>
                         <div class="input-group">
-                            <input type="password" id="password" class="form-control" required placeholder="输入密码" autocomplete="new-password">
+                            <input type="password" id="password" class="form-control" placeholder="输入密码" autocomplete="new-password">
                             <div class="input-group-append">
                                 <button type="button" class="toggle-btn" onclick="togglePasswordVisibility('password')">
                                     <i class="fas fa-eye"></i>
                                 </button>
                             </div>
                         </div>
+                        <small id="passwordHint" class="hidden" style="color: var(--text-secondary); margin-top: 0.5rem; display: block;">
+                            编辑模式：留空表示不修改密码
+                        </small>
                     </div>
                     
                     <!-- 密码生成器 -->
@@ -3657,6 +4562,57 @@ function getHTML5() {
                         </button>
                     </div>
                 </form>
+            </div>
+        </div>
+
+        <!-- 分类管理标签页 -->
+        <div id="categories-tab" class="tab-content">
+            <div class="form-section">
+                <h2 style="margin-bottom: 1.5rem; color: var(--text-primary);">📁 分类管理</h2>
+                
+                <!-- 分类管理器 -->
+                <div class="category-manager">
+                    <h4><i class="fas fa-plus-circle"></i> 添加新分类</h4>
+                    <div class="category-form">
+                        <div class="form-group">
+                            <label for="newCategoryName">分类名称 *</label>
+                            <input type="text" id="newCategoryName" class="form-control" placeholder="输入分类名称" maxlength="50" required>
+                        </div>
+                        <div class="form-group">
+                            <label for="newCategoryDescription">描述</label>
+                            <input type="text" id="newCategoryDescription" class="form-control" placeholder="分类描述（可选）" maxlength="200">
+                        </div>
+                        <div class="form-group">
+                            <label for="newCategoryColor">颜色</label>
+                            <input type="color" id="newCategoryColor" class="form-control" value="#6366f1" style="height: 45px;">
+                        </div>
+                        <div class="form-group">
+                            <label for="newCategoryIcon">图标</label>
+                            <select id="newCategoryIcon" class="form-control">
+                                <option value="fas fa-folder">📁 文件夹</option>
+                                <option value="fas fa-briefcase">💼 工作</option>
+                                <option value="fas fa-home">🏠 个人</option>
+                                <option value="fas fa-gamepad">🎮 游戏</option>
+                                <option value="fas fa-shopping-cart">🛒 购物</option>
+                                <option value="fas fa-university">🏦 银行</option>
+                                <option value="fas fa-envelope">✉️ 邮箱</option>
+                                <option value="fas fa-cloud">☁️ 云服务</option>
+                                <option value="fas fa-code">💻 开发</option>
+                                <option value="fas fa-heart">❤️ 社交</option>
+                            </select>
+                        </div>
+                        <div style="display: flex; align-items: end;">
+                            <button type="button" class="btn btn-primary" onclick="addCategory()">
+                                <i class="fas fa-plus"></i> 添加分类
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 分类列表 -->
+                <div class="category-list" id="categoryList">
+                    <!-- 分类项目将在这里动态生成 -->
+                </div>
             </div>
         </div>
 
@@ -3771,6 +4727,58 @@ function getHTML5() {
         </div>
     </div>
 
+    <!-- 分类编辑模态框 -->
+    <div id="categoryEditModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3><i class="fas fa-edit"></i> 编辑分类</h3>
+                <button class="close-btn" onclick="closeCategoryEditModal()" type="button">
+                    <i class="fas fa-times"></i>
+                </button>
+            </div>
+            <div id="categoryEditContent">
+                <form id="categoryEditForm">
+                    <input type="hidden" id="editCategoryId">
+                    <div class="form-group">
+                        <label for="editCategoryName">分类名称 *</label>
+                        <input type="text" id="editCategoryName" class="form-control" placeholder="输入分类名称" maxlength="50" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="editCategoryDescription">描述</label>
+                        <input type="text" id="editCategoryDescription" class="form-control" placeholder="分类描述（可选）" maxlength="200">
+                    </div>
+                    <div class="form-group">
+                        <label for="editCategoryColor">颜色</label>
+                        <input type="color" id="editCategoryColor" class="form-control" style="height: 45px;">
+                    </div>
+                    <div class="form-group">
+                        <label for="editCategoryIcon">图标</label>
+                        <select id="editCategoryIcon" class="form-control">
+                            <option value="fas fa-folder">📁 文件夹</option>
+                            <option value="fas fa-briefcase">💼 工作</option>
+                            <option value="fas fa-home">🏠 个人</option>
+                            <option value="fas fa-gamepad">🎮 游戏</option>
+                            <option value="fas fa-shopping-cart">🛒 购物</option>
+                            <option value="fas fa-university">🏦 银行</option>
+                            <option value="fas fa-envelope">✉️ 邮箱</option>
+                            <option value="fas fa-cloud">☁️ 云服务</option>
+                            <option value="fas fa-code">💻 开发</option>
+                            <option value="fas fa-heart">❤️ 社交</option>
+                        </select>
+                    </div>
+                    <div class="flex gap-4 mt-4">
+                        <button type="submit" class="btn btn-primary w-full">
+                            <i class="fas fa-save"></i> 保存更改
+                        </button>
+                        <button type="button" class="btn btn-secondary" onclick="closeCategoryEditModal()">
+                            <i class="fas fa-times"></i> 取消
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
     <script>
         // 全局变量
         let authToken = localStorage.getItem('authToken');
@@ -3781,6 +4789,7 @@ function getHTML5() {
         let selectedFile = null;
         let currentTab = 'passwords';
         let currentPasswordId = null; // 当前查看历史记录的密码ID
+        let editingCategoryId = null; // 当前编辑的分类ID
         
         // 分页相关变量
         let currentPage = 1;
@@ -3836,6 +4845,7 @@ function getHTML5() {
                 document.getElementById('lengthValue').textContent = this.value;
             });
             document.getElementById('passwordForm').addEventListener('submit', handlePasswordSubmit);
+            document.getElementById('categoryEditForm').addEventListener('submit', handleCategoryEditSubmit);
             document.getElementById('oauthLoginBtn').addEventListener('click', handleOAuthLogin);
             
             // 添加重复检查监听器
@@ -3846,6 +4856,7 @@ function getHTML5() {
                 if (e.key === 'Escape') {
                     hideDuplicateWarning();
                     closeHistoryModal();
+                    closeCategoryEditModal();
                 }
                 if (e.ctrlKey && e.key === 'k') {
                     e.preventDefault();
@@ -3921,6 +4932,8 @@ function getHTML5() {
                 loadPasswords(1);
             } else if (tabName === 'backup') {
                 loadWebDAVConfig();
+            } else if (tabName === 'categories') {
+                loadCategories();
             }
         }
 
@@ -4088,7 +5101,7 @@ function getHTML5() {
             }
         }
 
-        // 加载分类
+        // 加载分类 - 增强版本，支持完整分类信息
         async function loadCategories() {
             try {
                 const response = await fetch('/api/categories', {
@@ -4097,10 +5110,20 @@ function getHTML5() {
                     }
                 });
                 
+                if (!response.ok) {
+                    throw new Error('加载分类失败');
+                }
+                
                 categories = await response.json();
                 updateCategorySelects();
+                
+                // 如果当前在分类管理页面，渲染分类列表
+                if (currentTab === 'categories') {
+                    renderCategoryList();
+                }
             } catch (error) {
                 console.error('Failed to load categories:', error);
+                showNotification('加载分类失败: ' + error.message, 'error');
             }
         }
 
@@ -4113,12 +5136,212 @@ function getHTML5() {
             categorySelect.innerHTML = '<option value="">选择分类</option>';
             
             categories.forEach(category => {
-                categoryFilterSelect.innerHTML += \`<option value="\${category}">🏷️ \${category}</option>\`;
-                categorySelect.innerHTML += \`<option value="\${category}">\${category}</option>\`;
+                const categoryName = typeof category === 'string' ? category : category.name;
+                categoryFilterSelect.innerHTML += \`<option value="\${categoryName}">🏷️ \${categoryName}</option>\`;
+                categorySelect.innerHTML += \`<option value="\${categoryName}">\${categoryName}</option>\`;
             });
         }
 
-        // 渲染密码列表 - 添加历史记录按钮
+        // 渲染分类列表
+        function renderCategoryList() {
+            const categoryList = document.getElementById('categoryList');
+            
+            if (!categories || categories.length === 0) {
+                categoryList.innerHTML = \`
+                    <div class="empty-state">
+                        <div class="icon">📁</div>
+                        <h3>暂无分类</h3>
+                        <p>创建第一个分类来组织您的密码吧！</p>
+                    </div>
+                \`;
+                return;
+            }
+            
+            categoryList.innerHTML = categories.map(category => \`
+                <div class="category-item">
+                    <div class="category-info">
+                        <div class="category-icon" style="background: \${category.color || '#6366f1'}">
+                            <i class="\${category.icon || 'fas fa-folder'}"></i>
+                        </div>
+                        <div class="category-details">
+                            <h5>\${category.name}</h5>
+                            <div class="category-meta">
+                                \${category.description || '无描述'} • \${category.passwordCount || 0} 个密码
+                            </div>
+                        </div>
+                    </div>
+                    <div class="category-actions">
+                        <button class="btn btn-warning btn-sm" onclick="editCategory(\${category.id})" type="button" title="编辑分类">
+                            <i class="fas fa-edit"></i>
+                        </button>
+                        <button class="btn btn-danger btn-sm" onclick="deleteCategory(\${category.id}, '\${category.name}')" type="button" title="删除分类">
+                            <i class="fas fa-trash"></i>
+                        </button>
+                    </div>
+                </div>
+            \`).join('');
+        }
+
+        // 添加分类
+        async function addCategory() {
+            const name = document.getElementById('newCategoryName').value.trim();
+            const description = document.getElementById('newCategoryDescription').value.trim();
+            const color = document.getElementById('newCategoryColor').value;
+            const icon = document.getElementById('newCategoryIcon').value;
+            
+            if (!name) {
+                showNotification('请输入分类名称', 'error');
+                return;
+            }
+            
+            try {
+                const response = await fetch('/api/categories', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': 'Bearer ' + authToken
+                    },
+                    body: JSON.stringify({
+                        action: 'add',
+                        category: name,
+                        description: description || null,
+                        color: color,
+                        icon: icon
+                    })
+                });
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    showNotification(result.message + ' 📁');
+                    // 清空表单
+                    document.getElementById('newCategoryName').value = '';
+                    document.getElementById('newCategoryDescription').value = '';
+                    document.getElementById('newCategoryColor').value = '#6366f1';
+                    document.getElementById('newCategoryIcon').value = 'fas fa-folder';
+                    // 重新加载分类
+                    loadCategories();
+                } else {
+                    showNotification(result.error || '添加分类失败', 'error');
+                }
+            } catch (error) {
+                console.error('添加分类失败:', error);
+                showNotification('添加分类失败: ' + error.message, 'error');
+            }
+        }
+
+        // 编辑分类
+        async function editCategory(categoryId) {
+            try {
+                const response = await fetch(\`/api/categories/\${categoryId}\`, {
+                    headers: {
+                        'Authorization': 'Bearer ' + authToken
+                    }
+                });
+                
+                if (!response.ok) {
+                    throw new Error('获取分类信息失败');
+                }
+                
+                const category = await response.json();
+                
+                // 填充编辑表单
+                document.getElementById('editCategoryId').value = category.id;
+                document.getElementById('editCategoryName').value = category.name;
+                document.getElementById('editCategoryDescription').value = category.description || '';
+                document.getElementById('editCategoryColor').value = category.color || '#6366f1';
+                document.getElementById('editCategoryIcon').value = category.icon || 'fas fa-folder';
+                
+                editingCategoryId = categoryId;
+                
+                // 显示编辑模态框
+                document.getElementById('categoryEditModal').classList.add('show');
+            } catch (error) {
+                console.error('编辑分类失败:', error);
+                showNotification('获取分类信息失败: ' + error.message, 'error');
+            }
+        }
+
+        // 处理分类编辑表单提交
+        async function handleCategoryEditSubmit(e) {
+            e.preventDefault();
+            
+            const categoryId = document.getElementById('editCategoryId').value;
+            const name = document.getElementById('editCategoryName').value.trim();
+            const description = document.getElementById('editCategoryDescription').value.trim();
+            const color = document.getElementById('editCategoryColor').value;
+            const icon = document.getElementById('editCategoryIcon').value;
+            
+            if (!name) {
+                showNotification('请输入分类名称', 'error');
+                return;
+            }
+            
+            try {
+                const response = await fetch(\`/api/categories/\${categoryId}\`, {
+                    method: 'PUT',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': 'Bearer ' + authToken
+                    },
+                    body: JSON.stringify({
+                        name: name,
+                        description: description || null,
+                        color: color,
+                        icon: icon
+                    })
+                });
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    showNotification(result.message + ' ✅');
+                    closeCategoryEditModal();
+                    loadCategories();
+                } else {
+                    showNotification(result.error || '更新分类失败', 'error');
+                }
+            } catch (error) {
+                console.error('更新分类失败:', error);
+                showNotification('更新分类失败: ' + error.message, 'error');
+            }
+        }
+
+        // 删除分类
+        async function deleteCategory(categoryId, categoryName) {
+            if (!confirm(\`确定要删除分类 "\${categoryName}" 吗？\n\n注意：只有在该分类下没有密码时才能删除。\`)) {
+                return;
+            }
+            
+            try {
+                const response = await fetch(\`/api/categories/\${categoryId}\`, {
+                    method: 'DELETE',
+                    headers: {
+                        'Authorization': 'Bearer ' + authToken
+                    }
+                });
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    showNotification(result.message + ' 🗑️');
+                    loadCategories();
+                } else {
+                    showNotification(result.error || '删除分类失败', 'error');
+                }
+            } catch (error) {
+                console.error('删除分类失败:', error);
+                showNotification('删除分类失败: ' + error.message, 'error');
+            }
+        }
+
+        // 关闭分类编辑模态框
+        function closeCategoryEditModal() {
+            document.getElementById('categoryEditModal').classList.remove('show');
+            editingCategoryId = null;
+        }
+
+        // 渲染密码列表 - 修改为卡片网格布局，将历史和编辑按钮移到右上角
         function renderPasswords() {
             const grid = document.getElementById('passwordsGrid');
             
@@ -4133,61 +5356,73 @@ function getHTML5() {
                 return;
             }
             
-            grid.innerHTML = passwords.map(password => \`
-                <article class="password-card">
-                    <header class="password-header">
-                        <div class="site-icon">
-                            <i class="fas fa-globe"></i>
-                        </div>
-                        <div class="password-meta">
-                            <h3>\${password.siteName}</h3>
-                            \${password.category ? \`<span class="category-badge">\${password.category}</span>\` : ''}
-                        </div>
-                    </header>
-                    
-                    <div class="password-field">
-                        <label>👤 用户名</label>
-                        <div class="value">\${password.username}</div>
-                    </div>
-                    
-                    <div class="password-field">
-                        <label>🔑 密码</label>
-                        <div class="value" id="pwd-\${password.id}">••••••••</div>
-                    </div>
-                    
-                    \${password.url ? \`
+            grid.innerHTML = passwords.map(password => {
+                // 截断URL显示
+                const truncateUrl = (url, maxLength = 30) => {
+                    if (!url) return '';
+                    if (url.length <= maxLength) return url;
+                    return url.substring(0, maxLength) + '...';
+                };
+
+                return \`
+                    <article class="password-card">
+                        <header class="password-header">
+                            <div class="password-header-left">
+                                <div class="site-icon">
+                                    <i class="fas fa-globe"></i>
+                                </div>
+                                <div class="password-meta">
+                                    <h3 title="\${password.siteName}">\${password.siteName}</h3>
+                                    \${password.category ? \`<span class="category-badge">\${password.category}</span>\` : ''}
+                                </div>
+                            </div>
+                            <div class="password-header-right">
+                                <button class="quick-action-btn" onclick="showPasswordHistory('\${password.id}')" type="button" title="查看历史">
+                                    <i class="fas fa-history"></i>
+                                </button>
+                                <button class="quick-action-btn" onclick="editPassword('\${password.id}')" type="button" title="编辑">
+                                    <i class="fas fa-edit"></i>
+                                </button>
+                            </div>
+                        </header>
+                        
                         <div class="password-field">
-                            <label>🔗 网址</label>
-                            <div class="value"><a href="\${password.url}" target="_blank" rel="noopener noreferrer">\${password.url}</a></div>
+                            <label>👤 用户名</label>
+                            <div class="value" title="\${password.username}">\${password.username}</div>
                         </div>
-                    \` : ''}
-                    
-                    \${password.notes ? \`
-                        <div class="password-field">
-                            <label>📝 备注</label>
-                            <div class="value">\${password.notes}</div>
-                        </div>
-                    \` : ''}
-                    
-                    <footer class="password-actions">
-                        <button class="btn btn-secondary btn-sm" onclick="togglePasswordDisplay('\${password.id}')" type="button" title="显示/隐藏密码">
-                            <i class="fas fa-eye"></i>
-                        </button>
-                        <button class="btn btn-secondary btn-sm" onclick="copyPassword('\${password.id}')" type="button" title="复制密码">
-                            <i class="fas fa-copy"></i>
-                        </button>
-                        <button class="btn btn-info btn-sm" onclick="showPasswordHistory('\${password.id}')" type="button" title="查看历史">
-                            <i class="fas fa-history"></i>
-                        </button>
-                        <button class="btn btn-warning btn-sm" onclick="editPassword('\${password.id}')" type="button" title="编辑">
-                            <i class="fas fa-edit"></i>
-                        </button>
-                        <button class="btn btn-danger btn-sm" onclick="deletePassword('\${password.id}')" type="button" title="删除">
-                            <i class="fas fa-trash"></i>
-                        </button>
-                    </footer>
-                </article>
-            \`).join('');
+                        
+                        \${password.url ? \`
+                            <div class="password-field">
+                                <label>🔗 网址</label>
+                                <div class="value url-value">
+                                    <a href="\${password.url}" target="_blank" rel="noopener noreferrer" title="\${password.url}">
+                                        \${truncateUrl(password.url)}
+                                    </a>
+                                </div>
+                            </div>
+                        \` : ''}
+                        
+                        \${password.notes ? \`
+                            <div class="password-field">
+                                <label>📝 备注</label>
+                                <div class="value" title="\${password.notes}">\${password.notes.length > 50 ? password.notes.substring(0, 50) + '...' : password.notes}</div>
+                            </div>
+                        \` : ''}
+                        
+                        <footer class="password-actions">
+                            <button class="btn btn-secondary btn-sm" onclick="togglePasswordDisplay('\${password.id}', event)" type="button" title="显示/隐藏密码">
+                                <i class="fas fa-eye"></i>
+                            </button>
+                            <button class="btn btn-secondary btn-sm" onclick="copyPassword('\${password.id}')" type="button" title="复制密码">
+                                <i class="fas fa-copy"></i>
+                            </button>
+                            <button class="btn btn-danger btn-sm" onclick="deletePassword('\${password.id}')" type="button" title="删除">
+                                <i class="fas fa-trash"></i>
+                            </button>
+                        </footer>
+                    </article>
+                \`;
+            }).join('');
         }
 
         // 显示密码历史记录
@@ -4471,28 +5706,66 @@ function getHTML5() {
             loadPasswords(1, searchTerm, categoryFilter);
         }
 
-        // 显示/隐藏密码
-        async function togglePasswordDisplay(passwordId) {
-            const element = document.getElementById(\`pwd-\${passwordId}\`);
-            const button = event.target.closest('button');
+        // 修正后的显示/隐藏密码函数 - 正确传递事件对象
+        async function togglePasswordDisplay(passwordId, event) {
+            const passwordCard = event.target.closest('.password-card');
+            let passwordDisplay = passwordCard.querySelector('.password-display');
             
-            if (element.textContent === '••••••••') {
+            if (!passwordDisplay) {
+                // 创建密码显示区域
+                passwordDisplay = document.createElement('div');
+                passwordDisplay.className = 'password-field password-display';
+                passwordDisplay.innerHTML = \`
+                    <label>🔑 密码</label>
+                    <div class="value" style="font-family: 'SF Mono', 'Monaco', 'Cascadia Code', monospace; background: #f8fafc; padding: 0.75rem; border: 1px solid var(--border-color); border-radius: var(--border-radius-sm); margin-top: 0.5rem;">
+                        <div class="loading" style="width: 1rem; height: 1rem;"></div> 正在获取...
+                    </div>
+                \`;
+                
+                // 插入到最后一个 password-field 之后
+                const lastField = passwordCard.querySelector('.password-field:last-of-type');
+                if (lastField) {
+                    lastField.after(passwordDisplay);
+                } else {
+                    passwordCard.querySelector('.password-actions').before(passwordDisplay);
+                }
+                
                 try {
+                    console.log('获取密码:', passwordId);
                     const response = await fetch(\`/api/passwords/\${passwordId}/reveal\`, {
                         headers: {
                             'Authorization': 'Bearer ' + authToken
                         }
                     });
                     
+                    console.log('密码API响应状态:', response.status);
+                    
+                    if (!response.ok) {
+                        const errorText = await response.text();
+                        console.error('获取密码失败:', errorText);
+                        throw new Error(\`HTTP \${response.status}: \${errorText}\`);
+                    }
+                    
                     const data = await response.json();
-                    element.textContent = data.password;
-                    button.innerHTML = '<i class="fas fa-eye-slash"></i>';
+                    console.log('获取到密码数据:', { hasPassword: !!data.password });
+                    
+                    if (data.error) {
+                        throw new Error(data.error);
+                    }
+                    
+                    passwordDisplay.querySelector('.value').textContent = data.password;
+                    event.target.innerHTML = '<i class="fas fa-eye-slash"></i>';
+                    event.target.title = '隐藏密码';
                 } catch (error) {
-                    showNotification('获取密码失败', 'error');
+                    console.error('获取密码失败:', error);
+                    showNotification('获取密码失败: ' + error.message, 'error');
+                    passwordDisplay.remove();
                 }
             } else {
-                element.textContent = '••••••••';
-                button.innerHTML = '<i class="fas fa-eye"></i>';
+                // 隐藏密码
+                passwordDisplay.remove();
+                event.target.innerHTML = '<i class="fas fa-eye"></i>';
+                event.target.title = '显示密码';
             }
         }
 
@@ -4505,15 +5778,25 @@ function getHTML5() {
                     }
                 });
                 
+                if (!response.ok) {
+                    throw new Error(\`HTTP \${response.status}\`);
+                }
+                
                 const data = await response.json();
+                
+                if (data.error) {
+                    throw new Error(data.error);
+                }
+                
                 await navigator.clipboard.writeText(data.password);
                 showNotification('密码已复制到剪贴板 📋');
             } catch (error) {
-                showNotification('复制失败', 'error');
+                console.error('复制密码失败:', error);
+                showNotification('复制失败: ' + error.message, 'error');
             }
         }
 
-        // 编辑密码
+        // 编辑密码 - 修正版本，支持编辑时密码可选
         function editPassword(passwordId) {
             const password = passwords.find(p => p.id === passwordId);
             if (!password) return;
@@ -4522,10 +5805,16 @@ function getHTML5() {
             
             document.getElementById('siteName').value = password.siteName;
             document.getElementById('username').value = password.username;
+            // 编辑时不显示密码，保持为空
             document.getElementById('password').value = '';
+            document.getElementById('password').placeholder = '留空表示不修改密码';
             document.getElementById('category').value = password.category || '';
             document.getElementById('url').value = password.url || '';
             document.getElementById('notes').value = password.notes || '';
+            
+            // 显示编辑模式提示
+            document.getElementById('passwordRequiredIndicator').textContent = '';
+            document.getElementById('passwordHint').classList.remove('hidden');
             
             // 隐藏重复警告
             hideDuplicateWarning();
@@ -4535,7 +5824,7 @@ function getHTML5() {
             
             // 更新按钮文本
             const submitBtn = document.querySelector('#passwordForm button[type="submit"]');
-            submitBtn.innerHTML = '<i class="fas fa-save"></i> 更新密码';
+            submitBtn.innerHTML = '<i class="fas fa-save"></i> 保存更改';
         }
 
         // 删除密码 - 支持分页
@@ -4562,22 +5851,34 @@ function getHTML5() {
             }
         }
 
-        // 处理密码表单提交 - 改进版本，处理重复检查
+        // 处理密码表单提交 - 修正版本，支持编辑时密码可选
         async function handlePasswordSubmit(e) {
             e.preventDefault();
             
             const formData = {
-                siteName: document.getElementById('siteName').value,
-                username: document.getElementById('username').value,
+                siteName: document.getElementById('siteName').value.trim(),
+                username: document.getElementById('username').value.trim(),
                 password: document.getElementById('password').value,
                 category: document.getElementById('category').value,
-                url: document.getElementById('url').value,
-                notes: document.getElementById('notes').value
+                url: document.getElementById('url').value.trim(),
+                notes: document.getElementById('notes').value.trim()
             };
             
-            // 如果是编辑模式，添加ID
-            if (editingPasswordId) {
-                formData.id = editingPasswordId;
+            // 验证必填字段
+            if (!formData.siteName || !formData.username) {
+                showNotification('网站名称和用户名为必填项', 'error');
+                return;
+            }
+            
+            // 如果是新增模式，密码为必填项
+            if (!editingPasswordId && !formData.password) {
+                showNotification('密码为必填项', 'error');
+                return;
+            }
+            
+            // 如果是编辑模式且密码为空，则不更新密码字段
+            if (editingPasswordId && !formData.password) {
+                delete formData.password;
             }
             
             try {
@@ -4597,25 +5898,33 @@ function getHTML5() {
                     showNotification(editingPasswordId ? '密码已更新 ✅' : '密码已添加 ✅');
                     clearForm();
                     loadPasswords(currentPage, searchQuery, categoryFilter);
+                    loadCategories(); // 重新加载分类以更新选择器
                 } else if (response.status === 409) {
                     // 处理重复冲突
                     const result = await response.json();
                     showDuplicateWarning(result.existing);
                     showNotification(result.message, 'warning');
                 } else {
-                    showNotification('保存失败', 'error');
+                    const errorData = await response.json();
+                    showNotification(errorData.error || '保存失败', 'error');
                 }
             } catch (error) {
-                showNotification('保存失败', 'error');
+                console.error('保存失败:', error);
+                showNotification('保存失败: ' + error.message, 'error');
             }
         }
 
-        // 清空表单
+        // 清空表单 - 修正版本，重置编辑状态
         function clearForm() {
             document.getElementById('passwordForm').reset();
             document.getElementById('lengthValue').textContent = '16';
+            document.getElementById('password').placeholder = '输入密码';
             editingPasswordId = null;
             hideDuplicateWarning();
+            
+            // 重置密码字段状态
+            document.getElementById('passwordRequiredIndicator').textContent = '*';
+            document.getElementById('passwordHint').classList.add('hidden');
             
             // 恢复按钮文本
             const submitBtn = document.querySelector('#passwordForm button[type="submit"]');
@@ -4834,6 +6143,7 @@ function getHTML5() {
                 if (result.success) {
                     showNotification(result.message + ' 🔄');
                     loadPasswords(currentPage, searchQuery, categoryFilter);
+                    loadCategories(); // 重新加载分类
                 } else {
                     showNotification(result.error || '恢复失败', 'error');
                 }
@@ -4989,6 +6299,7 @@ function getHTML5() {
                         document.getElementById('encryptedImportForm').classList.add('hidden');
                         selectedFile = null;
                         loadPasswords(currentPage, searchQuery, categoryFilter);
+                        loadCategories(); // 重新加载分类
                     } else {
                         showNotification(result.error || '导入失败', 'error');
                     }
